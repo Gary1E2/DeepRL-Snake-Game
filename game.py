@@ -1,10 +1,18 @@
 import pygame
-from random import randint
+import random
+from random import randint, sample
 import numpy as np
+import matplotlib.pyplot as plt
 import math
 
+import torch
+
+from collections import deque
+
+from model import RLNet, RLTrainer
+
 # game loop
-class CarGame:
+class SnakeGame:
     def __init__(self):
         # init pygame
         pygame.init()
@@ -17,12 +25,15 @@ class CarGame:
         # player data
         self.player_body = [[4, 6], [3, 6], [2, 6]]
         self.player_direction = (1, 0)
+        self.drawing_player = False
         self.score = 0
+        self.record = 0
         self.gameover_state = False
 
         # apple data
         self.apple_pos = [-33, -33]
         self.eaten = False
+        self.apple_reward = False
 
         # Solve state
         self.solving = False
@@ -34,7 +45,24 @@ class CarGame:
         pygame.display.set_caption("Car Game")
 
         # font setting
-        self.font = pygame.font.Font('freesansbold.ttf', 32)
+        self.font = pygame.font.Font('freesansbold.ttf', 16)
+
+        # model init
+        self.model = RLNet()
+        self.trainer = RLTrainer(self.model)
+
+        self.memory = deque(maxlen=100000)
+        self.n_games = 0
+        self.batch_size = 1000
+        self.reward = 0
+        self.move_count = 0
+        self.scores = []
+        self.avg_scores = []
+
+        # plot init
+        plt.ion()
+        plt.figure(figsize=(6, 3))
+        plt.tight_layout()
 
 
     def cycle(self):
@@ -47,43 +75,236 @@ class CarGame:
         self.move()
         self.draw_player()
 
-        # draw apple
-        self.apple()
-
         # get player input
         self.events()
-        self.solver()
+
+        # draw apple
+        self.apple()
         
-        # draw score count
-        score = self.font.render(f'score: {self.score}', True, (0, 0, 0), (255, 255, 255))
-        scoreRect = score.get_rect()
-        scoreRect.center = (3 * self.cell_size, 12.5 * self.cell_size)
+        # draw score count (with record and game count)
+        score = self.font.render(f'score: {self.score}  record: {self.record}  n_games: {self.n_games}', True, (0, 0, 0), (255, 255, 255))
+        scoreRect = score.get_rect(left=self.cell_size, top=(12 * self.cell_size))
         self.screen.blit(score, scoreRect)
 
         # check player obstacle collision
         self.collision_check()
         
-        # update game display
-        pygame.time.delay(100)
+        # update game display (tunable for training speed)
+        pygame.time.delay(20)
         pygame.display.update()
 
-        # solve if action performed or game started NOTE: Solver disabled
-        # if not self.solving:
-        #     self.solver()
-
     def solver(self):
-        """ Neural Network reinforcement learning solver handler """
-        
-        # control player snake
-        # if actions[0] == (0, 1):
-        #     self.direction('d')
-        # elif actions[0] == (0, -1):
-        #     self.direction('a')
-        # elif actions[0] == (-1, 0): # reverse y axis direction due to flipped simulated environment
-        #     self.direction('w')
-        # elif actions[0] == (1, 0):  # reverse y axis direction due to flipped simulated environment
-        #     self.direction('s')
+        """ Neural Network reinforcement learning solver handler """        
 
+        # ==============================
+        # 1. Get the current/initial state
+        # ==============================
+
+        state_initial = self.get_state()
+
+        # ==============================
+        # 2. Get the next action via exploitation vs exploration
+        # ==============================
+
+        self.epsilon = 80 - self.n_games
+        chosen_action = [0, 0, 0]
+        
+        # exploration (random)
+        if random.randint(0, 200) < self.epsilon:
+            move = random.randint(0, 2)
+            chosen_action[move] = 1
+        # exploitation (model prediction)
+        else:
+            state0 = torch.tensor(state_initial, dtype=torch.float)
+            prediction = self.model(state0)
+            move = torch.argmax(prediction).item()
+            chosen_action[move] = 1
+
+        # ==============================
+        # 3. Perform the next action
+        # ==============================
+
+        if chosen_action == [1, 0, 0]:  # turn left
+            if self.player_direction == (0, -1):
+                self.direction('a')
+            elif self.player_direction == (0, 1):
+                self.direction('d')
+            elif self.player_direction == (-1, 0):
+                self.direction('s')
+            elif self.player_direction == (1, 0):
+                self.direction('w')
+        elif chosen_action == [0, 1, 0]:  # turn right
+            if self.player_direction == (0, -1):
+                self.direction('d')
+            elif self.player_direction == (0, 1):
+                self.direction('a')
+            elif self.player_direction == (-1, 0):
+                self.direction('w')
+            elif self.player_direction == (1, 0):
+                self.direction('s')
+        
+        # do nothing if go straight
+
+        # cycle the game to get next state with chosen action
+        self.cycle()
+        self.move_count += 1
+
+        # ==============================
+        # 4. Get reward/penalty of next state/chosen action (score and gameover state provided through game)
+        # ==============================
+
+        # NOTE: can be rewards or penalty, will affect design of downstream processes
+        reward_obs = -10       # out of bounds penalty
+        reward_apple = 10      # reach apple reward
+        reward_step = 0        # action taking penalty
+        
+        done = False
+
+        # NOTE: reward/penalty system design determined by how rewards/penalty are used
+
+        # prevent repetitive motion by move limit gameover
+        if self.gameover_state or self.move_count > 192:
+            self.reward += reward_obs
+            self.move_count = 0
+            done = True
+        elif self.apple_reward:
+            self.reward += reward_apple
+            self.apple_reward = False
+            self.move_count = 0
+        else:
+            self.reward += reward_step
+
+        # ==============================
+        # 5. Get new state from chosen action
+        # ==============================
+
+        state_new = self.get_state()
+
+        # ==============================
+        # 6. Train on current (initial state, chosen_action, self.reward, state_new, done) information
+        # ==============================
+
+        self.trainer.train_step(state_initial, chosen_action, self.reward, state_new, done)
+
+        # ==============================
+        # 7. Remember/store current game information for bulk training
+        # ==============================
+
+        self.memory.append((state_initial, chosen_action, self.reward, state_new, done))  # pops left when maxlen is reached
+
+        # ==============================
+        # 8. Train on total collected game information memory in an n_game
+        # ==============================
+        
+        if done:
+            # train on self.memory
+            if len(self.memory) > self.batch_size:
+                mini_sample = random.sample(self.memory, self.batch_size) # list of tuples
+            else:
+                mini_sample = self.memory
+
+            states, actions, rewards, next_states, dones = zip(*mini_sample)
+            self.trainer.train_step(states, actions, rewards, next_states, dones)
+
+            # save best model
+            if self.score > self.record:
+                self.record = self.score
+                self.model.save()
+
+            # debug/tracking info
+            # print('Game', self.n_games, 'Score', self.score, 'Record:', self.record)
+
+            # reset the game (gameover)
+            self.gameover_state = False
+            self.player_body = [[4, 6], [3, 6], [2, 6]]
+            self.n_games += 1
+            self.scores.append(self.score)
+            self.avg_scores.append(np.mean(self.scores))
+            self.score = 0
+
+            # print(self.scores, list(range(0, self.n_games)))
+            plt.ylim(ymin=0)
+            plt.title('Model Performance over n games')
+            plt.xlabel('n games')
+            plt.ylabel('Score')
+            plt.plot(self.scores, color='blue')
+            plt.plot(self.avg_scores, color='red')
+            plt.show(block=False)
+
+        # clear previous reward for next state/action
+        self.reward = 0       
+
+
+    def get_state(self):
+        """ Get game state information for model training """
+        # danger based on global snake head pos (no player direction)
+        global_danger_left = ((0 > (self.player_body[0][0] - 1)) or 
+                              (([self.player_body[0][0] - 1, self.player_body[0][1]]) in self.player_body) or 
+                              ((self.player_body[0][0] - 1) in self.player_body[1:]))
+
+        global_danger_right = (((self.cell_cols - 1) < (self.player_body[0][0] + 1)) or 
+                               (([self.player_body[0][0] + 1, self.player_body[0][1]]) in self.player_body) or 
+                               ((self.player_body[0][0] + 1) in self.player_body[1:]))
+
+        global_danger_up = ((0 > (self.player_body[0][1] - 1)) or 
+                            (([self.player_body[0][0], self.player_body[0][1] - 1]) in self.player_body) or 
+                            ((self.player_body[0][1] - 1) in self.player_body[1:]))
+
+        global_danger_down = (((self.cell_rows - 1) < (self.player_body[0][1] + 1)) or 
+                              (([self.player_body[0][0], self.player_body[0][1] + 1]) in self.player_body) or 
+                              ((self.player_body[0][1] + 1) in self.player_body[1:]))
+        
+        # danger based on relative snake head pos (considers player direction)
+        if self.player_direction == (1, 0):
+            self.danger_left = global_danger_up
+            self.danger_right = global_danger_down
+            self.danger_straight = global_danger_right
+
+        elif self.player_direction == (-1, 0):
+            self.danger_left = global_danger_down
+            self.danger_right = global_danger_up
+            self.danger_straight = global_danger_left
+
+        elif self.player_direction == (0, 1):
+            self.danger_left = global_danger_right
+            self.danger_right = global_danger_left
+            self.danger_straight = global_danger_down
+
+        elif self.player_direction == (0, -1):
+            self.danger_left = global_danger_left
+            self.danger_right = global_danger_right
+            self.danger_straight = global_danger_down
+
+        # binary player facing direction info
+        self.dir_left = (self.player_direction == (-1, 0))
+        self.dir_right = (self.player_direction == (1, 0))
+        self.dir_up = (self.player_direction == (0, -1))
+        self.dir_down = (self.player_direction == (0, 1))
+
+        # apple direction info 
+        self.apple_left = (self.player_body[0][0] > self.apple_pos[0])
+        self.apple_right = (self.player_body[0][0] < self.apple_pos[0])
+        self.apple_up = (self.player_body[0][1] > self.apple_pos[1])
+        self.apple_down = (self.player_body[0][1] < self.apple_pos[1])
+        
+        state = [
+            self.danger_left,
+            self.danger_right,
+            self.danger_straight,
+
+            self.dir_left,
+            self.dir_right,
+            self.dir_up,
+            self.dir_down,
+
+            self.apple_left,
+            self.apple_right,
+            self.apple_up,
+            self.apple_down
+        ]
+        
+        return np.array(state, dtype=int)
+    
 
     def draw_board(self):
         """ Game environment display with checkerboard pattern """
@@ -136,7 +357,7 @@ class CarGame:
 
                 # allow quitting at all times
                 if event.key == pygame.K_SPACE:
-                    print('p pressed')
+                    print('space pressed')
                     pygame.quit()
                     return True
                 
@@ -150,17 +371,19 @@ class CarGame:
                         self.direction('a')
                     elif event.key == pygame.K_d:
                         self.direction('d')
-                    elif event.key == pygame.K_l:
-                        while True:
-                            for event in pygame.event.get():
-                                if event.type == pygame.KEYDOWN:
-                                    if event.key == pygame.K_k:
-                                        break
-                # restart game
-                if self.gameover_state:
-                    if event.key == pygame.K_f:
-                        self.gameover_state = False
-                        self.player_body = [[4, 6], [3, 6], [2, 6]]
+                    # debug freeze state
+                    # elif event.key == pygame.K_l:
+                    #     while True:
+                    #         for event in pygame.event.get():
+                    #             if event.type == pygame.KEYDOWN:
+                    #                 if event.key == pygame.K_k:
+                    #                     break
+
+                # restart game (auto restart)
+                # if self.gameover_state:
+                #     if event.key == pygame.K_f:
+                #         self.gameover_state = False
+                #         self.player_body = [[4, 6], [3, 6], [2, 6]]
 
 
     def direction(self, direction):
@@ -219,6 +442,7 @@ class CarGame:
         if self.apple_pos == self.player_body[0] and not self.eaten:
             self.score += 1
             self.eaten = True
+            self.apple_reward = True
 
         # check if appending normally will result in body part being out of bounds
         if self.eaten:
@@ -256,9 +480,9 @@ class CarGame:
         
         # player head out of bounds or in other player body parts: gameover
         if ((0 > self.player_body[0][0]) or (self.cell_cols - 1 < self.player_body[0][0]) or 
-            (0 > self.player_body[0][1]) or (self.cell_rows -1 < self.player_body[0][1]) or 
+            (0 > self.player_body[0][1]) or (self.cell_rows - 1 < self.player_body[0][1]) or 
             self.player_body[0] in self.player_body[1:]):
-            self.score = 0
+            # self.score = 0
             self.apple_pos = [-33, -33]
             self.player_direction = (1, 0)
             self.gameover()
@@ -270,13 +494,13 @@ class CarGame:
         self.gameover_state = True
 
         # freeze game state until restart
-        while self.gameover_state:
-            self.events()
+        # while self.gameover_state:
+        #     self.events()
                 
 
-game = CarGame()
+game = SnakeGame()
 
 # game loop
 while True:
-    if game.cycle():
+    if game.solver():
         break
